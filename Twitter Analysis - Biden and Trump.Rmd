@@ -1,0 +1,385 @@
+---
+title: "Twitter Analysis - Biden and Trump"
+authors: "Kayley and Lia"
+output: html_document
+date: "2024-11-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+library(tidyverse)
+library(tidytext)
+library(lubridate)
+library(ggwordcloud)
+library(caret)
+```
+
+
+## Load Data
+```{r}
+#Trump Tweets
+trump <- read_csv("/Users/kayleywatson/Desktop/Stat 218/realdonaldtrump.csv")
+
+#Biden Tweets
+biden <- read_csv("/Users/kayleywatson/Desktop/Stat 218/JoeBidenTweets.csv")
+```
+Data sourced from kaggle.
+
+- https://www.kaggle.com/datasets/austinreese/trump-tweets
+
+- https://www.kaggle.com/datasets/rohanrao/joe-biden-tweets
+
+
+We chose to explore differences tweets posted by the accounts of two presidents: Donald Trump and Joe Biden. We found two data sets, one for each president. Biden's tweets ranged from October 24th, 2007 to November 1st 2020. Trump's tweets ranged from May 4th, 2009 to June 17th, 2020. Biden tweeted a total of 6,064 times while Trump tweeted 43,352 times. This means that there is more data from Trump's account than Biden's.
+
+Because each of these tweets has multiple words in it, we needed to use some method to decrease the amount of data we were using to make the run time more manageable. Originally, it was supposed to take about 8 hours using the entirety of both data sets, so instead we decided to focus on a specific window of time that we thought would yield interesting results. We isolated a period of four months from each of the candidates: January to April of 2020. This period was after both presidents had announced they intended to run for president and it also included the beginning of the Covid-19 pandemic. 
+
+Furthermore, the decrease in data volume helped to solve the issue of class imbalance and made it so our final set had around a 60/40 split, favoring Trump. Our resulting model confirms that the case imbalance was handled well since our kappa score is 0.6971857 and accuracy is 0.8535653, which is pretty good. 
+
+## Clean and Merge Data
+```{r}
+colnames(trump)
+colnames(biden)
+
+#Trump data
+trump <- trump %>%
+  select(3, 4)
+names(trump)[1] <- "tweet"
+
+new_order = c("date", "tweet")
+trump <- trump[, new_order]
+
+trump <- trump %>%
+  mutate(author = "trump") %>%
+  filter(year(date) == 2020) %>%
+  filter(month(date) == sequence(1:4)) %>%
+  mutate(id = row_number())
+
+#Biden data
+biden <- biden %>%
+  select(2, 4)
+
+names(biden)[1] <- "date"
+
+biden <- biden %>%
+  mutate(author = "biden") %>%
+  filter(year(date) == 2020) %>%
+  filter(month(date) == sequence(1:4)) %>%
+  mutate(id = row_number() + 386)
+
+
+#Check ids for the two datasets
+any(trump$id %in% biden$id)
+
+#bind datasets into one
+tweets <- rbind(trump, biden) %>%
+  select(-1)
+
+#get rid of scraped in url
+tweets <- tweets %>%
+  mutate(tweet = gsub("https://.*", "", tweet)) %>%
+  mutate(tweet = gsub("pic.twitter.com*", "", tweet))
+
+#check for duplicate ids
+anyDuplicated(tweets$id)
+
+```
+
+We looked at our data and realized that there were some issues. The scraped in data included the URLs of the tweets, which could have affected the ending word of each tweet and made creating our document-feature matrix a lot messier. We also found that there were links to images attached to some tweets, mainly Trump's, which is interesting, but not what we are testing. Because of this, we needed to remove the links since they could have biased our model. 
+
+## Create Document-Feature Matrix
+```{r}
+#remove stop words
+tweets_clean <- tweets %>%
+  unnest_tokens(input = "tweet", 
+                output = "word", 
+                token = "words") %>%
+  filter(!(word %in% stop_words$word)) 
+
+
+colnames(tweets_clean)
+names(tweets_clean)[1] <- "tweeter"
+names(tweets_clean)[2] <- "numerical_code"
+
+tweets_clean_wc <- tweets_clean %>%
+  count(numerical_code, tweeter, word, name = "n")
+
+dfm <- tweets_clean_wc %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols = c("numerical_code", "tweeter"),
+    names_from = "word",
+    values_from = "n",
+    values_fn = sum,
+    values_fill = list(n = 0)
+  )
+
+```
+
+We created a document-feature matrix and got rid of stop words, since they add extra unnessesary information and would not give us any compelling examples of unique language usage. 
+
+## Explore with Unsupervised Learning
+```{r}
+lost_tweets <- setdiff(tweets$id, dfm$numerical_code)
+
+#same rows as dfm
+tweets_lost_re <- tweets |>
+  filter(!id %in% lost_tweets)
+
+dfm_hclust <- dfm %>% 
+  select(-numerical_code, -tweeter, -word) %>%
+  scale() %>%
+  dist() %>%
+  hclust()
+
+  plot(dfm_hclust)
+
+  #number of clusters
+dfm_clusts <- cutree(dfm_hclust, k = 50)
+
+#checking groupings of 1 as outliers
+outlier_clusters <- names(table(dfm_clusts)[table(dfm_clusts) == 1])
+
+#finding rows that are outliers
+outliers <- dfm[dfm_clusts %in% outlier_clusters, ]
+
+#printing outlier rows to check
+outlier_tweets <- tweets_lost_re |>
+  filter(id %in% outliers$numerical_code)
+
+#language tweets 32 only a bit of spanish
+langauge_tweets <- c(587, 35, 18, 9, 4, 5, 2)
+```
+
+In order to further understand the data and outliers, we used a dendrogram to understand how the data groups together, etc. From the dendrogram, we mapped the outlier tweet row numbers to the main tweets data set in order to see what the tweets looked like and see if they were fit to include in the dataset or if they merited special treatment of some sort. After looking through the dendrogram outliers, we noticed some tweets were considered far in distance from others as a result of the inclusion of URLs or usernames. The ones that were the most concerning were those in other languages. We noticed 7 tweets that had Spanish, Hebrew, Sanskrit, and Arabic. Because our model is mostly in English, we decided to remove words that were in other languages and special characters from the word count data sets, as special characters and other languages are data that don't seem relevant to the goals of this project.
+
+## Create Document-Feature Matrix with Only Words Above a Certain Count
+```{r}
+song_word_counts <- dfm %>%
+  select_if(is.numeric) %>%
+  colSums()
+
+X <- 7
+
+#Take my song_word_counts vector and only return elements which have a value greater than X.
+good_words <- names(song_word_counts[which(song_word_counts > X)])
+
+dfm_2 <- dfm %>%
+  select(all_of(good_words))
+```
+
+We then decided to create a new document feature matrix that only included words that occurred more than 7 times in all the tweets we selected (January to April 2020) from the original 2 sets. By doing this, it got rid of common words that did not give us any meaningful information or show differences between the two tweeters. We choose 7 because it was a nice balance between highlighting words used repeatedly and words that did not mean anything. It also gave us 164 common words between the two authors to build our further models and visual off of. 
+
+# Preliminary Random Forest
+```{r}
+library(caret)
+
+names(dfm_2)[1] <-"id"
+
+tweets_join <- dfm_2 %>%
+  left_join(tweets, dfm_2, by = "id") %>%
+  select(-99) #delete column with full tweets
+  
+
+tweet_rf_data <- tweets_join %>%
+  mutate(author = factor(tweets_join$author)) %>% #categorical variable
+  select(-id) %>%
+  na.omit()
+
+prelim_tweet_rf <- train(author ~ .,
+                 data = tweet_rf_data,
+                 method = "ranger",
+                 importance = "impurity")
+
+confusionMatrix(prelim_tweet_rf)
+
+#variable importance
+varImp(prelim_tweet_rf) 
+```
+
+After running a preliminary random forest, one interesting pair of words were "Donald," and "Trump". Because these are the first and last names of one of the authors, it is important to make sure they are not biasing the results. If the two candidates signed their tweets with their names, that would be telling the model exactly what to predict, which is essentially "cheating". After further exploration, we found that Biden was actually the one naming Trump as a topic of interest in his tweets. This means that the two words "Donald" and "Trump" are significant and important for the model and should be kept in as useful indicators. The word "Biden" only popped up a few times and was used fairly equally by both candidates and not to sign off a tweet, so it does not bias the data and can stay in the data set.
+
+## PCA and Random Forest
+```{r}
+#PCA
+pca_tweets <- tweet_rf_data %>%
+  select(-author, -tweet) %>%
+  prcomp()
+
+round((pca_tweets$sdev)^2, 3)
+
+# adding PCAs to the dataframe in order to shorten runtime of the
+#random Forest --> 20 (rows w more than 5% varience explained)
+
+tweet_rf_final <- tweet_rf_data |> 
+  mutate(PC1 = pca_tweets$x[,1],
+         PC2 = pca_tweets$x[,2],
+         PC3 = pca_tweets$x[,3],
+         PC4 = pca_tweets$x[,4],
+         PC5 = pca_tweets$x[,5],
+         PC6 = pca_tweets$x[,6],
+         PC7 = pca_tweets$x[,7],
+         PC8 = pca_tweets$x[,8],
+         PC9 = pca_tweets$x[,9],
+         PC10 = pca_tweets$x[,10],
+         PC11 = pca_tweets$x[,11],
+         PC12 = pca_tweets$x[,12])
+
+
+boot632_validation <- trainControl(
+  method = "boot632",
+  number = 50,)
+set.seed(10)
+tweet_rf1 <- train(author ~ PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10 + PC11 + PC12,
+                  data = tweet_rf_final,
+                  method = "ranger",
+                  importance = "impurity",
+                  tuneGrid = data.frame(expand.grid(mtry = c(2), splitrule = c("gini"), min.node.size = 7)),
+                  trControl = boot632_validation)
+
+confusionMatrix(tweet_rf1)
+
+tweet_rf2 <- train(author ~ .,
+                 data = tweet_rf_data,
+                 method = "ranger",
+                 importance = "impurity")
+confusionMatrix(tweet_rf2)
+  
+#variable importance
+varImp(tweet_rf1) 
+varImp(tweet_rf2)
+
+```
+Because tweets rf data contains 164 variables, we decided to use Principal Component Analysis in order to limit the number of variables going into the model without losing too much of the data's variance. We used the first 12 principal components in the model in order to speed up the run time of the model for tuning and testing.
+
+We decided to use a random forest model to classify whether a tweet was a Trump or Biden Tweet, because decision trees model how word choice, sentences, and tweets are constructed. We choose a random forest over a tree model, since random forests tend to perform better than trees. We chose to use only 12 of the principal components, since accuracy went down when more were used. We used accuracy as the principal metric to evaluate how good the model performed, since the model had relatively balanced classes. Additionally, we used an mtry of 2, splitrule of gini, and a min node size of of 7, since this combination of parameters led to the highest accuracy after utilizing a variety of values in the tune grid. Finally, we used .63 bootstrapping to validate the model and ensure that it generalizes well to other tweet data. The data generated in the knitted html may differ slightly due to change in seed.
+
+From the variable importance, we can see that the random forest primarily uses PC1, PC5, PC6, and PC2 to classify the tweets. Components such as PC7, PC10, and PC8 still have some importance but are not nearly as important in classification. This makes sense, as the first few components explain the majority of the variance in the dataset while the later components explain less variance.
+
+```{r}
+#importance of each PC 10x1
+#matricx of PCS 10xn
+#word count vector : nX1
+matrix_pc <- pca_tweets$rotation[, 1:12]
+
+component_importance <- c(
+  PC1	= 100.0000000,
+  PC5	= 45.6384630,
+  PC6	= 32.1936934,
+  PC2	= 31.4335335,
+  PC3	= 24.9136014,
+  PC4	= 24.3480730,
+  PC9	= 13.8923525,
+  PC11 = 10.1768336,
+  PC12 = 5.1219175,
+  PC10 = 3.0075727,
+  PC8	= 0.7633637,
+  PC7	= 0.0000000
+  )
+
+
+
+word_importance <- rowSums(matrix_pc * component_importance[1:12])
+
+word_importance <- data.frame(word_importance)
+
+shift <- -1 * min(word_importance$word_importance)
+
+word_importance <- word_importance |>
+  mutate(word_importance = word_importance + shift) 
+print(word_importance) %>%
+  arrange(-word_importance) %>%
+  head(25)
+```
+
+To extract the importance of each word to the principal component random forest model, we extracted how important each word was to each component. From there, we multiplied the two to extract how important each word is in the model. Unfortunately, this only extracts how important each word is for the model overall rather than for each class. 
+
+The resulting words include terms like military, country, president, foxnews, iran, trump, white, republican, democrats, and economy. These terms are what you would expect if you had to guess what the top words used by presidential candidates are on their twitter accounts. It also highlights certain current events that were happening such as the lead up to the 2020 election and political issues regarding Iran. 
+
+
+## Visualization (Comparison Cloud) 
+```{r}
+cloud_df <- tweets_clean_wc %>%
+  select(-1) %>%
+  filter(!grepl("[^A-Za-z0-9[:punct:]\\s]", word)) %>%
+  group_by(word, tweeter) %>%  # Group by word and category
+  summarize(n = sum(n), .groups = "drop") %>%
+  na.omit()
+
+names(cloud_df)[2] <- "category"
+names(cloud_df)[4] <- "freq"
+
+#Plot based on author and frequency
+top_words_df1 <- cloud_df %>%
+  group_by(category) %>%        
+  arrange(desc(n)) %>%      
+  slice_head(n = 25) %>%
+  ungroup() 
+
+set.seed(42)
+ggplot(
+  top_words_df1,
+  aes(
+    label = word, size = n, 
+    x = category,         
+    color = category
+  )
+) +
+  geom_text_wordcloud_area() +
+  scale_size_area(max_size = 30) +    
+  scale_color_manual(values = c(
+    "trump" = "red",          
+    "biden" = "blue"             
+  )) +
+  scale_x_discrete(breaks = NULL) +   
+  theme_minimal() +
+  labs(title = "By Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Plot based on frequency weighted by importance
+cloud_mag <- cloud_df %>%
+  mutate(imp_val = word_importance$word_importance*n)
+
+top_words_df2 <- cloud_mag %>%
+  group_by(category) %>%        
+  arrange(desc(imp_val)) %>%      
+  slice_head(n = 25) %>%
+  ungroup()      
+
+cloud_mag %>%
+  group_by(category) %>% 
+  filter(category == "biden") %>%
+  arrange(desc(imp_val)) %>% 
+  head(10)
+
+set.seed(42)
+ggplot(
+  top_words_df2,
+  aes(
+    label = word, size = imp_val, 
+    x = category,         
+    color = category
+  )
+) +
+  geom_text_wordcloud_area() +
+  scale_size_area(max_size = 30) +    
+  scale_color_manual(values = c(
+    "trump" = "red",          
+    "biden" = "blue"             
+  )) +
+  scale_x_discrete(breaks = NULL) +   
+  theme_minimal() + 
+  labs(title = "Weighted Importance") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+For our visualization, we wanted to use a method that was quick and easy to understand. Since we are dealing with different words and their frequencies, we decided to create a word cloud to compare the words most often used by both candidates in their tweets. We arranged the data by how many occurrences there were of each word and took the top 25 from each candidate. We then created a cloud of those words and that made words used more often larger and more prominent. We then made Biden's words blue, and Trump's red because of their political party affiliations. 
+
+Through the first visual, you can see that both candidates use terms associated with patriotism, such as America, American, and Americans (we decided not to group similar words by their "root" because of the time constraints of this project). They also address the individuals when they use terms like "people". Words like "crisis" and "health" used by Biden show the impacts of the Covid-19 health crisis during the start of 2020 and Trump's use of "military" and "Iran" are consistent with different political issues occurring abroad. Lastly, focus on both candidate's upcoming presidential races are mentioned in words like "campaign" and "beat" used by Biden and "republican," "democrats", "impeachment", "congress", and "dems" by Trump. Overall, the models employed to explore the data are successful at pulling out key terms of importance and highlighting their similarities and overlaps as well as their differences. 
+
+We also decided to add a second model that directly incorporated our tuned model and use of PCA. We decided to create a new column to quantify word importance by the frequency weighted (multiplied) by the word_importance score we found earlier. It is important to note that because we used "ranger," we only have an overall importance value, not a value for each candidate. Using the new value calculation method, our second model is sightly different. Some of the most important words for Trump were "people", "news", "democrats", and "house", while some of Biden's most important words were "donald", "president", "american", and "trump." It is important to note that one of the words that appeared on Trump's side of the graphic are the word "Trump". If we were to use this data for further exploration with the new weights calculation, we should get rid of the term "Trump" so we don't cause bias. Since it only occurs in our end graphic as a relatively small word, it is okay to leave it because this is just a short project exploration. In conclusion, these words align more closely with our set of important words, but the new graphic is still able to show similarities and differences between the candidates' tweets. 
+
